@@ -1,0 +1,21 @@
+{
+  "name": "Budget Advisor",
+  "short_name": "Budget",
+  "description": "Smart expense tracking with amortization",
+  "start_url": "/",
+  "id": "/",
+  "display": "standalone",
+  "background_color": "#1a1a2e",
+  "theme_color": "#6c5ce7",
+  "orientation": "portrait-primary",
+  "scope": "/",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "48x48 72x72 96x96 128x128 192x192 256x256 512x512",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ],
+  "categories": ["finance", "productivity"]
+}

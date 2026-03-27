@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#6c5ce7">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Budget">
+  <title>Budget Advisor</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="manifest" href="/manifest.json">
+  <link rel="apple-touch-icon" href="/icon.svg">
+</head>
+<body>
+  <!-- Auth Screen -->
+  <div id="authScreen" class="auth-screen">
+    <div class="auth-box">
+      <h1>💰 Budget Advisor</h1>
+      <p class="auth-subtitle">Track expenses, amortize subscriptions, collect from friends</p>
+      
+      <!-- Step 1: Enter Email -->
+      <div id="emailStep" class="auth-form">
+        <h2>Login / Sign Up</h2>
+        <form onsubmit="sendOTP(event)">
+          <div class="form-group">
+            <input type="email" id="authEmail" placeholder="Enter your email" required>
+          </div>
+          <button type="submit" class="btn-primary btn-full" id="sendOtpBtn">Send OTP</button>
+        </form>
+      </div>
+      
+      <!-- Step 2: Enter OTP -->
+      <div id="otpStep" class="auth-form" style="display:none;">
+        <h2>Enter OTP</h2>
+        <p class="otp-sent-to">OTP sent to <span id="otpEmail"></span></p>
+        <form onsubmit="verifyOTP(event)">
+          <div class="form-group">
+            <input type="text" id="otpInput" placeholder="Enter 6-digit OTP" maxlength="6" pattern="[0-9]{6}" required>
+          </div>
+          <div id="devOtpBox" class="dev-otp-box" style="display:none;">
+            <span>Dev Mode OTP:</span>
+            <strong id="devOtpDisplay"></strong>
+          </div>
+          <button type="submit" class="btn-primary btn-full">Verify & Login</button>
+        </form>
+        <p class="auth-switch"><a href="#" onclick="backToEmail()">← Use different email</a></p>
+      </div>
+      
+      <div id="authError" class="auth-error"></div>
+    </div>
+  </div>
+
+  <!-- Main App -->
+  <div id="mainApp" class="container" style="display:none;">
+    <header>
+      <div>
+        <h1>💰 Budget Advisor</h1>
+        <p class="subtitle">Welcome, <span id="userName"></span></p>
+      </div>
+      <button onclick="logout()" class="btn-logout">Logout</button>
+    </header>
+
+    <div class="controls">
+      <div class="month-selector">
+        <label>Month:</label>
+        <select id="monthSelect"></select>
+        <select id="yearSelect"></select>
+        <button onclick="loadData()" class="btn-primary">Load</button>
+      </div>
+      <div class="actions">
+        <button onclick="showUploadModal()" class="btn-secondary">📄 Upload Statement</button>
+        <button onclick="showAddExpenseModal()" class="btn-secondary">➕ Add Expense</button>
+        <button onclick="exportToExcel()" class="btn-success">📊 Export Excel</button>
+      </div>
+    </div>
+
+    <div class="dashboard">
+      <div class="card summary-card">
+        <h3>Your Expenses</h3>
+        <div class="big-number" id="totalExpense">₹0</div>
+        <p class="label">This month (excluding others)</p>
+      </div>
+      <div class="card summary-card">
+        <h3>To Collect</h3>
+        <div class="big-number collect" id="totalCollect">₹0</div>
+        <p class="label">From others (all time)</p>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <h3>By Category</h3>
+        <div id="categoryBreakdown" class="breakdown-list"></div>
+      </div>
+      <div class="card">
+        <h3>Money to Collect</h3>
+        <div id="collectBreakdown" class="breakdown-list"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <h3>Transactions</h3>
+        <div class="filters">
+          <select id="filterPerson" onchange="loadExpenses()">
+            <option value="">All</option>
+          </select>
+        </div>
+      </div>
+      <div class="table-container">
+        <table id="expensesTable">
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Description</th>
+              <th>Amount</th>
+              <th>Category</th>
+              <th>On Behalf Of</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="expensesBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Upload Modal -->
+  <div id="uploadModal" class="modal">
+    <div class="modal-content">
+      <span class="close" onclick="closeModal('uploadModal')">&times;</span>
+      <h2>Upload Bank Statement</h2>
+      <form id="uploadForm" onsubmit="uploadStatement(event)">
+        <div class="form-group">
+          <label>Source</label>
+          <select name="source" required>
+            <option value="Bank Statement">Bank Statement (UPI)</option>
+            <option value="Credit Card">Credit Card Bill</option>
+            <option value="Other">Other</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>PDF File</label>
+          <input type="file" name="statement" accept=".pdf,.txt,.csv" required>
+        </div>
+        <button type="submit" class="btn-primary">Upload & Parse</button>
+      </form>
+      <div id="uploadResult" class="result-box"></div>
+    </div>
+  </div>
+
+  <!-- Add Expense Modal -->
+  <div id="addExpenseModal" class="modal">
+    <div class="modal-content">
+      <span class="close" onclick="closeModal('addExpenseModal')">&times;</span>
+      <h2 id="expenseModalTitle">Add Expense</h2>
+      <form id="expenseForm" onsubmit="saveExpense(event)">
+        <input type="hidden" id="expenseId">
+        <div class="form-row">
+          <div class="form-group">
+            <label>Date</label>
+            <input type="date" id="expenseDate" required>
+          </div>
+          <div class="form-group">
+            <label>Amount (₹)</label>
+            <input type="number" id="expenseAmount" step="0.01" required>
+          </div>
+        </div>
+        <div class="form-group">
+          <label>Description</label>
+          <input type="text" id="expenseDescription" required>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Category</label>
+            <select id="expenseCategory"></select>
+          </div>
+          <div class="form-group">
+            <label>On Behalf Of</label>
+            <select id="expenseOnBehalf">
+              <option value="">Self</option>
+            </select>
+            <input type="text" id="newPerson" placeholder="Or add new person...">
+          </div>
+        </div>
+        <div class="form-group checkbox-group">
+          <label>
+            <input type="checkbox" id="isAmortized" onchange="toggleAmortization()">
+            Amortize (spread over months)
+          </label>
+        </div>
+        <div class="form-group amortization-group" id="amortizationFields" style="display:none;">
+          <label>Number of Months</label>
+          <input type="number" id="amortizationMonths" min="2" max="60" value="12">
+          <small>e.g., 12 for annual subscription</small>
+        </div>
+        <button type="submit" class="btn-primary">Save Expense</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Edit Modal -->
+  <div id="editModal" class="modal">
+    <div class="modal-content">
+      <span class="close" onclick="closeModal('editModal')">&times;</span>
+      <h2>Edit Expense</h2>
+      <form id="editForm" onsubmit="updateExpense(event)">
+        <input type="hidden" id="editId">
+        <div class="form-row">
+          <div class="form-group">
+            <label>Date</label>
+            <input type="date" id="editDate" required>
+          </div>
+          <div class="form-group">
+            <label>Amount (₹)</label>
+            <input type="number" id="editAmount" step="0.01" required>
+          </div>
+        </div>
+        <div class="form-group">
+          <label>Description</label>
+          <input type="text" id="editDescription" required>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Category</label>
+            <select id="editCategory"></select>
+          </div>
+          <div class="form-group">
+            <label>On Behalf Of</label>
+            <select id="editOnBehalf">
+              <option value="">Self</option>
+            </select>
+          </div>
+        </div>
+        <button type="submit" class="btn-primary">Update</button>
+      </form>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+  <script>
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js');
+    }
+  </script>
+</body>
+</html>
