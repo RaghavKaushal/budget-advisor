@@ -1,48 +1,38 @@
 require('dotenv').config();
 const express = require('express');
 const session = require('express-session');
-const SqliteStore = require('better-sqlite3-session-store')(session);
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const pdfParse = require('pdf-parse');
-const Database = require('better-sqlite3');
+const { createClient } = require('@libsql/client');
 const Anthropic = require('@anthropic-ai/sdk');
 const XLSX = require('xlsx');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const isProduction = process.env.NODE_ENV === 'production' || process.env.RAILWAY_ENVIRONMENT;
+const isProduction = process.env.NODE_ENV === 'production' || process.env.RENDER;
 
-const dbPath = process.env.DATABASE_PATH || './db/budget.db';
-const db = new Database(dbPath);
-
-// Session store using SQLite (persists across restarts)
-const sessionDb = new Database(process.env.SESSION_DB_PATH || './db/sessions.db');
+const db = createClient({
+  url: process.env.TURSO_DATABASE_URL || 'file:local.db',
+  authToken: process.env.TURSO_AUTH_TOKEN
+});
 
 app.use(express.json());
 
-// Trust proxy for Railway/production (needed for secure cookies behind proxy)
 if (isProduction) {
   app.set('trust proxy', 1);
 }
 
 app.use(session({
-  store: new SqliteStore({
-    client: sessionDb,
-    expired: {
-      clear: true,
-      intervalMs: 900000 // Clear expired sessions every 15 min
-    }
-  }),
   secret: process.env.SESSION_SECRET || 'budget-advisor-secret-key-change-me',
   resave: false,
   saveUninitialized: false,
   cookie: { 
-    secure: isProduction, // true for HTTPS in production
+    secure: isProduction,
     httpOnly: true,
-    sameSite: isProduction ? 'none' : 'lax', // 'none' needed for cross-site in production
-    maxAge: 30 * 24 * 60 * 60 * 1000 // 30 days
+    sameSite: isProduction ? 'none' : 'lax',
+    maxAge: 30 * 24 * 60 * 60 * 1000
   }
 }));
 
@@ -50,69 +40,80 @@ app.use(express.static('public'));
 
 const upload = multer({ dest: 'uploads/' });
 
-// Database schema - Email OTP based auth
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    email TEXT UNIQUE NOT NULL,
-    name TEXT,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS otps (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    email TEXT NOT NULL,
-    otp TEXT NOT NULL,
-    expires_at TEXT NOT NULL,
-    used INTEGER DEFAULT 0,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS expenses (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    date TEXT NOT NULL,
-    description TEXT NOT NULL,
-    amount REAL NOT NULL,
-    category TEXT,
-    on_behalf_of TEXT,
-    is_amortized INTEGER DEFAULT 0,
-    amortization_months INTEGER,
-    amortization_start TEXT,
-    source TEXT,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS categories (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT UNIQUE NOT NULL
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_expenses_user ON expenses(user_id);
-  CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date);
-  CREATE INDEX IF NOT EXISTS idx_otps_email ON otps(email);
-`);
-
 const defaultCategories = [
   'Food & Dining', 'Groceries', 'Transportation', 'Utilities', 'Rent/EMI',
   'Entertainment', 'Shopping', 'Healthcare', 'Subscriptions', 'Travel',
   'Education', 'Personal Care', 'Gifts', 'Insurance', 'Investments', 'Other'
 ];
 
-const insertCategory = db.prepare('INSERT OR IGNORE INTO categories (name) VALUES (?)');
-defaultCategories.forEach(cat => insertCategory.run(cat));
+async function initDatabase() {
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT UNIQUE NOT NULL,
+      name TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS otps (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT NOT NULL,
+      otp TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      used INTEGER DEFAULT 0,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS expenses (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      date TEXT NOT NULL,
+      description TEXT NOT NULL,
+      amount REAL NOT NULL,
+      category TEXT,
+      on_behalf_of TEXT,
+      is_amortized INTEGER DEFAULT 0,
+      amortization_months INTEGER,
+      amortization_start TEXT,
+      source TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    )
+  `);
+
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS categories (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT UNIQUE NOT NULL
+    )
+  `);
+
+  await db.execute(`CREATE INDEX IF NOT EXISTS idx_expenses_user ON expenses(user_id)`);
+  await db.execute(`CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date)`);
+  await db.execute(`CREATE INDEX IF NOT EXISTS idx_otps_email ON otps(email)`);
+
+  for (const cat of defaultCategories) {
+    await db.execute({
+      sql: 'INSERT OR IGNORE INTO categories (name) VALUES (?)',
+      args: [cat]
+    });
+  }
+  
+  console.log('Database initialized');
+}
 
 const anthropic = process.env.ANTHROPIC_API_KEY 
   ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
   : null;
 
-// Generate 6-digit OTP
 function generateOTP() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
-// Auth middleware
 function requireAuth(req, res, next) {
   if (!req.session.userId) {
     return res.status(401).json({ error: 'Please login first' });
@@ -132,20 +133,20 @@ app.post('/api/auth/send-otp', async (req, res) => {
   const normalizedEmail = email.toLowerCase().trim();
   
   try {
-    // Delete old unused OTPs for this email
-    db.prepare('DELETE FROM otps WHERE email = ? AND used = 0').run(normalizedEmail);
+    await db.execute({
+      sql: 'DELETE FROM otps WHERE email = ? AND used = 0',
+      args: [normalizedEmail]
+    });
     
-    // Generate new OTP
     const otp = generateOTP();
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString(); // 10 minutes
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
     
-    // Store OTP
-    db.prepare('INSERT INTO otps (email, otp, expires_at) VALUES (?, ?, ?)')
-      .run(normalizedEmail, otp, expiresAt);
+    await db.execute({
+      sql: 'INSERT INTO otps (email, otp, expires_at) VALUES (?, ?, ?)',
+      args: [normalizedEmail, otp, expiresAt]
+    });
     
-    // Check if Resend API key exists
     if (process.env.RESEND_API_KEY) {
-      // Send email via Resend
       try {
         const response = await fetch('https://api.resend.com/emails', {
           method: 'POST',
@@ -173,21 +174,19 @@ app.post('/api/auth/send-otp', async (req, res) => {
         }
       } catch (emailError) {
         console.error('Email error:', emailError);
-        // Fallback: return OTP in response (dev mode)
         res.json({ 
           message: 'OTP generated (email failed, showing here)', 
           email: normalizedEmail,
-          otp: otp, // DEV MODE: Remove in production!
+          otp: otp,
           devMode: true
         });
       }
     } else {
-      // No email service configured - DEV MODE
       console.log(`\n📧 OTP for ${normalizedEmail}: ${otp}\n`);
       res.json({ 
         message: 'OTP generated', 
         email: normalizedEmail,
-        otp: otp, // DEV MODE: Shows OTP in response
+        otp: otp,
         devMode: true
       });
     }
@@ -196,7 +195,7 @@ app.post('/api/auth/send-otp', async (req, res) => {
   }
 });
 
-app.post('/api/auth/verify-otp', (req, res) => {
+app.post('/api/auth/verify-otp', async (req, res) => {
   const { email, otp, name } = req.body;
   
   if (!email || !otp) {
@@ -206,39 +205,48 @@ app.post('/api/auth/verify-otp', (req, res) => {
   const normalizedEmail = email.toLowerCase().trim();
   
   try {
-    // Find valid OTP
-    const otpRecord = db.prepare(`
-      SELECT * FROM otps 
-      WHERE email = ? AND otp = ? AND used = 0 AND expires_at > datetime('now')
-      ORDER BY created_at DESC LIMIT 1
-    `).get(normalizedEmail, otp);
+    const result = await db.execute({
+      sql: `SELECT * FROM otps 
+            WHERE email = ? AND otp = ? AND used = 0 AND expires_at > datetime('now')
+            ORDER BY created_at DESC LIMIT 1`,
+      args: [normalizedEmail, otp]
+    });
     
-    if (!otpRecord) {
+    if (result.rows.length === 0) {
       return res.status(401).json({ error: 'Invalid or expired OTP' });
     }
     
-    // Mark OTP as used
-    db.prepare('UPDATE otps SET used = 1 WHERE id = ?').run(otpRecord.id);
+    const otpRecord = result.rows[0];
     
-    // Find or create user
-    let user = db.prepare('SELECT * FROM users WHERE email = ?').get(normalizedEmail);
+    await db.execute({
+      sql: 'UPDATE otps SET used = 1 WHERE id = ?',
+      args: [otpRecord.id]
+    });
     
-    if (!user) {
-      // New user - create account
-      const result = db.prepare('INSERT INTO users (email, name) VALUES (?, ?)')
-        .run(normalizedEmail, name || normalizedEmail.split('@')[0]);
-      user = { id: result.lastInsertRowid, email: normalizedEmail, name: name || normalizedEmail.split('@')[0] };
+    const userResult = await db.execute({
+      sql: 'SELECT * FROM users WHERE email = ?',
+      args: [normalizedEmail]
+    });
+    
+    let user;
+    if (userResult.rows.length === 0) {
+      const insertResult = await db.execute({
+        sql: 'INSERT INTO users (email, name) VALUES (?, ?)',
+        args: [normalizedEmail, name || normalizedEmail.split('@')[0]]
+      });
+      user = { id: insertResult.lastInsertRowid, email: normalizedEmail, name: name || normalizedEmail.split('@')[0] };
+    } else {
+      user = userResult.rows[0];
     }
     
-    // Set session
-    req.session.userId = user.id;
+    req.session.userId = Number(user.id);
     req.session.userEmail = user.email;
     req.session.userName = user.name;
     
     res.json({ 
       message: 'Login successful', 
       user: { id: user.id, email: user.email, name: user.name },
-      isNewUser: !user.name
+      isNewUser: userResult.rows.length === 0
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -250,20 +258,27 @@ app.post('/api/auth/logout', (req, res) => {
   res.json({ message: 'Logged out' });
 });
 
-app.get('/api/auth/me', (req, res) => {
+app.get('/api/auth/me', async (req, res) => {
   if (!req.session.userId) {
     return res.json({ user: null });
   }
   
-  const user = db.prepare('SELECT id, email, name FROM users WHERE id = ?').get(req.session.userId);
-  res.json({ user });
+  const result = await db.execute({
+    sql: 'SELECT id, email, name FROM users WHERE id = ?',
+    args: [req.session.userId]
+  });
+  
+  res.json({ user: result.rows[0] || null });
 });
 
-app.put('/api/auth/profile', requireAuth, (req, res) => {
+app.put('/api/auth/profile', requireAuth, async (req, res) => {
   const { name } = req.body;
   
   try {
-    db.prepare('UPDATE users SET name = ? WHERE id = ?').run(name, req.session.userId);
+    await db.execute({
+      sql: 'UPDATE users SET name = ? WHERE id = ?',
+      args: [name, req.session.userId]
+    });
     req.session.userName = name;
     res.json({ message: 'Profile updated' });
   } catch (error) {
@@ -388,14 +403,13 @@ app.post('/api/upload-statement', requireAuth, upload.single('statement'), async
 
     const categorizedTransactions = await categorizeWithAI(transactions);
 
-    const insert = db.prepare(`
-      INSERT INTO expenses (user_id, date, description, amount, category, source)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `);
-
     const insertedIds = [];
     for (const t of categorizedTransactions) {
-      const result = insert.run(userId, t.date, t.description, t.amount, t.category, t.source);
+      const result = await db.execute({
+        sql: `INSERT INTO expenses (user_id, date, description, amount, category, source)
+              VALUES (?, ?, ?, ?, ?, ?)`,
+        args: [userId, t.date, t.description, t.amount, t.category, t.source]
+      });
       insertedIds.push(result.lastInsertRowid);
     }
 
@@ -410,7 +424,7 @@ app.post('/api/upload-statement', requireAuth, upload.single('statement'), async
   }
 });
 
-app.post('/api/expenses', requireAuth, (req, res) => {
+app.post('/api/expenses', requireAuth, async (req, res) => {
   const userId = req.session.userId;
   const { date, description, amount, category, on_behalf_of, is_amortized, amortization_months, source } = req.body;
   
@@ -419,39 +433,37 @@ app.post('/api/expenses', requireAuth, (req, res) => {
       const monthlyAmount = amount / amortization_months;
       const startDate = new Date(date);
       const insertedIds = [];
-      
-      const insert = db.prepare(`
-        INSERT INTO expenses (user_id, date, description, amount, category, on_behalf_of, is_amortized, amortization_months, amortization_start, source)
-        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
-      `);
 
       for (let i = 0; i < amortization_months; i++) {
         const expenseDate = new Date(startDate);
         expenseDate.setMonth(expenseDate.getMonth() + i);
         const dateStr = expenseDate.toISOString().split('T')[0];
         
-        const result = insert.run(
-          userId,
-          dateStr,
-          `${description} (${i + 1}/${amortization_months})`,
-          monthlyAmount,
-          category || 'Subscriptions',
-          on_behalf_of || null,
-          amortization_months,
-          date,
-          source || 'Manual'
-        );
+        const result = await db.execute({
+          sql: `INSERT INTO expenses (user_id, date, description, amount, category, on_behalf_of, is_amortized, amortization_months, amortization_start, source)
+                VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
+          args: [
+            userId,
+            dateStr,
+            `${description} (${i + 1}/${amortization_months})`,
+            monthlyAmount,
+            category || 'Subscriptions',
+            on_behalf_of || null,
+            amortization_months,
+            date,
+            source || 'Manual'
+          ]
+        });
         insertedIds.push(result.lastInsertRowid);
       }
       
       res.json({ message: `Created ${amortization_months} amortized entries`, ids: insertedIds });
     } else {
-      const insert = db.prepare(`
-        INSERT INTO expenses (user_id, date, description, amount, category, on_behalf_of, source)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `);
-      
-      const result = insert.run(userId, date, description, amount, category || 'Other', on_behalf_of || null, source || 'Manual');
+      const result = await db.execute({
+        sql: `INSERT INTO expenses (user_id, date, description, amount, category, on_behalf_of, source)
+              VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        args: [userId, date, description, amount, category || 'Other', on_behalf_of || null, source || 'Manual']
+      });
       res.json({ message: 'Expense added', id: result.lastInsertRowid });
     }
   } catch (error) {
@@ -459,129 +471,139 @@ app.post('/api/expenses', requireAuth, (req, res) => {
   }
 });
 
-app.get('/api/expenses', requireAuth, (req, res) => {
+app.get('/api/expenses', requireAuth, async (req, res) => {
   const userId = req.session.userId;
   const { month, year, on_behalf_of } = req.query;
   
-  let query = 'SELECT * FROM expenses WHERE user_id = ?';
-  const params = [userId];
+  let sql = 'SELECT * FROM expenses WHERE user_id = ?';
+  const args = [userId];
   
   if (month && year) {
-    query += " AND strftime('%Y-%m', date) = ?";
-    params.push(`${year}-${month.padStart(2, '0')}`);
+    sql += " AND strftime('%Y-%m', date) = ?";
+    args.push(`${year}-${month.padStart(2, '0')}`);
   }
   
   if (on_behalf_of) {
-    query += ' AND on_behalf_of = ?';
-    params.push(on_behalf_of);
+    sql += ' AND on_behalf_of = ?';
+    args.push(on_behalf_of);
   }
   
-  query += ' ORDER BY date DESC';
+  sql += ' ORDER BY date DESC';
   
-  const expenses = db.prepare(query).all(...params);
-  res.json(expenses);
+  const result = await db.execute({ sql, args });
+  res.json(result.rows);
 });
 
-app.put('/api/expenses/:id', requireAuth, (req, res) => {
+app.put('/api/expenses/:id', requireAuth, async (req, res) => {
   const userId = req.session.userId;
   const { id } = req.params;
   const { date, description, amount, category, on_behalf_of } = req.body;
   
   try {
-    const update = db.prepare(`
-      UPDATE expenses 
-      SET date = COALESCE(?, date),
-          description = COALESCE(?, description),
-          amount = COALESCE(?, amount),
-          category = COALESCE(?, category),
-          on_behalf_of = ?
-      WHERE id = ? AND user_id = ?
-    `);
-    
-    update.run(date, description, amount, category, on_behalf_of || null, id, userId);
+    await db.execute({
+      sql: `UPDATE expenses 
+            SET date = COALESCE(?, date),
+                description = COALESCE(?, description),
+                amount = COALESCE(?, amount),
+                category = COALESCE(?, category),
+                on_behalf_of = ?
+            WHERE id = ? AND user_id = ?`,
+      args: [date, description, amount, category, on_behalf_of || null, id, userId]
+    });
     res.json({ message: 'Expense updated' });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-app.delete('/api/expenses/:id', requireAuth, (req, res) => {
+app.delete('/api/expenses/:id', requireAuth, async (req, res) => {
   const userId = req.session.userId;
   try {
-    db.prepare('DELETE FROM expenses WHERE id = ? AND user_id = ?').run(req.params.id, userId);
+    await db.execute({
+      sql: 'DELETE FROM expenses WHERE id = ? AND user_id = ?',
+      args: [req.params.id, userId]
+    });
     res.json({ message: 'Expense deleted' });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-app.get('/api/summary', requireAuth, (req, res) => {
+app.get('/api/summary', requireAuth, async (req, res) => {
   const userId = req.session.userId;
   const { month, year } = req.query;
   const monthStr = `${year}-${month.padStart(2, '0')}`;
   
-  const totalExpense = db.prepare(`
-    SELECT COALESCE(SUM(amount), 0) as total 
-    FROM expenses 
-    WHERE user_id = ? AND strftime('%Y-%m', date) = ? AND on_behalf_of IS NULL
-  `).get(userId, monthStr);
+  const totalExpenseResult = await db.execute({
+    sql: `SELECT COALESCE(SUM(amount), 0) as total 
+          FROM expenses 
+          WHERE user_id = ? AND strftime('%Y-%m', date) = ? AND on_behalf_of IS NULL`,
+    args: [userId, monthStr]
+  });
 
-  const byCategory = db.prepare(`
-    SELECT category, SUM(amount) as total 
-    FROM expenses 
-    WHERE user_id = ? AND strftime('%Y-%m', date) = ?
-    GROUP BY category 
-    ORDER BY total DESC
-  `).all(userId, monthStr);
+  const byCategoryResult = await db.execute({
+    sql: `SELECT category, SUM(amount) as total 
+          FROM expenses 
+          WHERE user_id = ? AND strftime('%Y-%m', date) = ?
+          GROUP BY category 
+          ORDER BY total DESC`,
+    args: [userId, monthStr]
+  });
 
-  const onBehalfOf = db.prepare(`
-    SELECT on_behalf_of, SUM(amount) as total 
-    FROM expenses 
-    WHERE user_id = ? AND strftime('%Y-%m', date) = ? AND on_behalf_of IS NOT NULL
-    GROUP BY on_behalf_of
-  `).all(userId, monthStr);
+  const onBehalfOfResult = await db.execute({
+    sql: `SELECT on_behalf_of, SUM(amount) as total 
+          FROM expenses 
+          WHERE user_id = ? AND strftime('%Y-%m', date) = ? AND on_behalf_of IS NOT NULL
+          GROUP BY on_behalf_of`,
+    args: [userId, monthStr]
+  });
 
-  const pendingCollection = db.prepare(`
-    SELECT on_behalf_of, SUM(amount) as total 
-    FROM expenses 
-    WHERE user_id = ? AND on_behalf_of IS NOT NULL
-    GROUP BY on_behalf_of
-  `).all(userId);
+  const pendingCollectionResult = await db.execute({
+    sql: `SELECT on_behalf_of, SUM(amount) as total 
+          FROM expenses 
+          WHERE user_id = ? AND on_behalf_of IS NOT NULL
+          GROUP BY on_behalf_of`,
+    args: [userId]
+  });
 
   res.json({
-    totalExpense: totalExpense.total,
-    byCategory,
-    onBehalfOf,
-    pendingCollection
+    totalExpense: totalExpenseResult.rows[0]?.total || 0,
+    byCategory: byCategoryResult.rows,
+    onBehalfOf: onBehalfOfResult.rows,
+    pendingCollection: pendingCollectionResult.rows
   });
 });
 
-app.get('/api/people', requireAuth, (req, res) => {
+app.get('/api/people', requireAuth, async (req, res) => {
   const userId = req.session.userId;
-  const people = db.prepare('SELECT DISTINCT on_behalf_of as name FROM expenses WHERE user_id = ? AND on_behalf_of IS NOT NULL').all(userId);
-  res.json(people.map(p => p.name));
+  const result = await db.execute({
+    sql: 'SELECT DISTINCT on_behalf_of as name FROM expenses WHERE user_id = ? AND on_behalf_of IS NOT NULL',
+    args: [userId]
+  });
+  res.json(result.rows.map(p => p.name));
 });
 
-app.get('/api/categories', (req, res) => {
-  const categories = db.prepare('SELECT name FROM categories ORDER BY name').all();
-  res.json(categories.map(c => c.name));
+app.get('/api/categories', async (req, res) => {
+  const result = await db.execute('SELECT name FROM categories ORDER BY name');
+  res.json(result.rows.map(c => c.name));
 });
 
-app.get('/api/export', requireAuth, (req, res) => {
+app.get('/api/export', requireAuth, async (req, res) => {
   const userId = req.session.userId;
   const { month, year } = req.query;
   
-  let query = 'SELECT date, description, amount, category, on_behalf_of, source FROM expenses WHERE user_id = ?';
-  const params = [userId];
+  let sql = 'SELECT date, description, amount, category, on_behalf_of, source FROM expenses WHERE user_id = ?';
+  const args = [userId];
   
   if (month && year) {
-    query += " AND strftime('%Y-%m', date) = ?";
-    params.push(`${year}-${month.padStart(2, '0')}`);
+    sql += " AND strftime('%Y-%m', date) = ?";
+    args.push(`${year}-${month.padStart(2, '0')}`);
   }
   
-  query += ' ORDER BY date DESC';
+  sql += ' ORDER BY date DESC';
   
-  const expenses = db.prepare(query).all(...params);
+  const result = await db.execute({ sql, args });
+  const expenses = result.rows;
   
   const worksheetData = expenses.map(e => ({
     'Date': e.date,
@@ -607,28 +629,30 @@ app.get('/api/export', requireAuth, (req, res) => {
   XLSX.utils.book_append_sheet(wb, ws, 'Expenses');
 
   if (month && year) {
-    const summary = db.prepare(`
-      SELECT category, SUM(amount) as total 
-      FROM expenses 
-      WHERE user_id = ? AND strftime('%Y-%m', date) = ?
-      GROUP BY category
-    `).all(userId, `${year}-${month.padStart(2, '0')}`);
+    const summaryResult = await db.execute({
+      sql: `SELECT category, SUM(amount) as total 
+            FROM expenses 
+            WHERE user_id = ? AND strftime('%Y-%m', date) = ?
+            GROUP BY category`,
+      args: [userId, `${year}-${month.padStart(2, '0')}`]
+    });
 
-    const summaryWs = XLSX.utils.json_to_sheet(summary.map(s => ({
+    const summaryWs = XLSX.utils.json_to_sheet(summaryResult.rows.map(s => ({
       'Category': s.category,
       'Total (₹)': s.total
     })));
     XLSX.utils.book_append_sheet(wb, summaryWs, 'Summary');
 
-    const onBehalf = db.prepare(`
-      SELECT on_behalf_of, SUM(amount) as total 
-      FROM expenses 
-      WHERE user_id = ? AND strftime('%Y-%m', date) = ? AND on_behalf_of IS NOT NULL
-      GROUP BY on_behalf_of
-    `).all(userId, `${year}-${month.padStart(2, '0')}`);
+    const onBehalfResult = await db.execute({
+      sql: `SELECT on_behalf_of, SUM(amount) as total 
+            FROM expenses 
+            WHERE user_id = ? AND strftime('%Y-%m', date) = ? AND on_behalf_of IS NOT NULL
+            GROUP BY on_behalf_of`,
+      args: [userId, `${year}-${month.padStart(2, '0')}`]
+    });
 
-    if (onBehalf.length > 0) {
-      const onBehalfWs = XLSX.utils.json_to_sheet(onBehalf.map(o => ({
+    if (onBehalfResult.rows.length > 0) {
+      const onBehalfWs = XLSX.utils.json_to_sheet(onBehalfResult.rows.map(o => ({
         'Person': o.on_behalf_of,
         'Amount to Collect (₹)': o.total
       })));
@@ -644,6 +668,11 @@ app.get('/api/export', requireAuth, (req, res) => {
   res.send(buffer);
 });
 
-app.listen(PORT, () => {
-  console.log(`Budget Advisor running at http://localhost:${PORT}`);
+initDatabase().then(() => {
+  app.listen(PORT, () => {
+    console.log(`Budget Advisor running at http://localhost:${PORT}`);
+  });
+}).catch(err => {
+  console.error('Failed to initialize database:', err);
+  process.exit(1);
 });
