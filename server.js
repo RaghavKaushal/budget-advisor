@@ -46,29 +46,44 @@ const defaultCategories = [
   'Education', 'Personal Care', 'Gifts', 'Insurance', 'Investments', 'Other'
 ];
 
+function toNumber(val) {
+  return typeof val === 'bigint' ? Number(val) : val;
+}
+
+function convertRow(row) {
+  if (!row) return row;
+  const converted = {};
+  for (const key in row) {
+    converted[key] = toNumber(row[key]);
+  }
+  return converted;
+}
+
+function convertRows(rows) {
+  return rows.map(convertRow);
+}
+
+let dbInitialized = false;
+
 async function initDatabase() {
-  await db.execute(`
-    CREATE TABLE IF NOT EXISTS users (
+  if (dbInitialized) return;
+  
+  await db.batch([
+    `CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       email TEXT UNIQUE NOT NULL,
       name TEXT,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-
-  await db.execute(`
-    CREATE TABLE IF NOT EXISTS otps (
+    )`,
+    `CREATE TABLE IF NOT EXISTS otps (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       email TEXT NOT NULL,
       otp TEXT NOT NULL,
       expires_at TEXT NOT NULL,
       used INTEGER DEFAULT 0,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-
-  await db.execute(`
-    CREATE TABLE IF NOT EXISTS expenses (
+    )`,
+    `CREATE TABLE IF NOT EXISTS expenses (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER NOT NULL,
       date TEXT NOT NULL,
@@ -82,27 +97,24 @@ async function initDatabase() {
       source TEXT,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (user_id) REFERENCES users(id)
-    )
-  `);
-
-  await db.execute(`
-    CREATE TABLE IF NOT EXISTS categories (
+    )`,
+    `CREATE TABLE IF NOT EXISTS categories (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT UNIQUE NOT NULL
-    )
-  `);
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_expenses_user ON expenses(user_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date)`,
+    `CREATE INDEX IF NOT EXISTS idx_otps_email ON otps(email)`
+  ]);
 
-  await db.execute(`CREATE INDEX IF NOT EXISTS idx_expenses_user ON expenses(user_id)`);
-  await db.execute(`CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date)`);
-  await db.execute(`CREATE INDEX IF NOT EXISTS idx_otps_email ON otps(email)`);
-
-  for (const cat of defaultCategories) {
-    await db.execute({
+  await db.batch(
+    defaultCategories.map(cat => ({
       sql: 'INSERT OR IGNORE INTO categories (name) VALUES (?)',
       args: [cat]
-    });
-  }
+    }))
+  );
   
+  dbInitialized = true;
   console.log('Database initialized');
 }
 
@@ -229,24 +241,26 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     });
     
     let user;
+    let isNewUser = false;
     if (userResult.rows.length === 0) {
       const insertResult = await db.execute({
         sql: 'INSERT INTO users (email, name) VALUES (?, ?)',
         args: [normalizedEmail, name || normalizedEmail.split('@')[0]]
       });
-      user = { id: insertResult.lastInsertRowid, email: normalizedEmail, name: name || normalizedEmail.split('@')[0] };
+      user = { id: toNumber(insertResult.lastInsertRowid), email: normalizedEmail, name: name || normalizedEmail.split('@')[0] };
+      isNewUser = true;
     } else {
       user = userResult.rows[0];
     }
     
-    req.session.userId = Number(user.id);
+    req.session.userId = toNumber(user.id);
     req.session.userEmail = user.email;
     req.session.userName = user.name;
     
     res.json({ 
       message: 'Login successful', 
-      user: { id: user.id, email: user.email, name: user.name },
-      isNewUser: userResult.rows.length === 0
+      user: { id: toNumber(user.id), email: user.email, name: user.name },
+      isNewUser
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -268,7 +282,7 @@ app.get('/api/auth/me', async (req, res) => {
     args: [req.session.userId]
   });
   
-  res.json({ user: result.rows[0] || null });
+  res.json({ user: convertRow(result.rows[0]) || null });
 });
 
 app.put('/api/auth/profile', requireAuth, async (req, res) => {
@@ -410,7 +424,7 @@ app.post('/api/upload-statement', requireAuth, upload.single('statement'), async
               VALUES (?, ?, ?, ?, ?, ?)`,
         args: [userId, t.date, t.description, t.amount, t.category, t.source]
       });
-      insertedIds.push(result.lastInsertRowid);
+      insertedIds.push(toNumber(result.lastInsertRowid));
     }
 
     res.json({
@@ -454,7 +468,7 @@ app.post('/api/expenses', requireAuth, async (req, res) => {
             source || 'Manual'
           ]
         });
-        insertedIds.push(result.lastInsertRowid);
+        insertedIds.push(toNumber(result.lastInsertRowid));
       }
       
       res.json({ message: `Created ${amortization_months} amortized entries`, ids: insertedIds });
@@ -464,7 +478,7 @@ app.post('/api/expenses', requireAuth, async (req, res) => {
               VALUES (?, ?, ?, ?, ?, ?, ?)`,
         args: [userId, date, description, amount, category || 'Other', on_behalf_of || null, source || 'Manual']
       });
-      res.json({ message: 'Expense added', id: result.lastInsertRowid });
+      res.json({ message: 'Expense added', id: toNumber(result.lastInsertRowid) });
     }
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -491,7 +505,7 @@ app.get('/api/expenses', requireAuth, async (req, res) => {
   sql += ' ORDER BY date DESC';
   
   const result = await db.execute({ sql, args });
-  res.json(result.rows);
+  res.json(convertRows(result.rows));
 });
 
 app.put('/api/expenses/:id', requireAuth, async (req, res) => {
@@ -567,10 +581,10 @@ app.get('/api/summary', requireAuth, async (req, res) => {
   });
 
   res.json({
-    totalExpense: totalExpenseResult.rows[0]?.total || 0,
-    byCategory: byCategoryResult.rows,
-    onBehalfOf: onBehalfOfResult.rows,
-    pendingCollection: pendingCollectionResult.rows
+    totalExpense: toNumber(totalExpenseResult.rows[0]?.total) || 0,
+    byCategory: convertRows(byCategoryResult.rows),
+    onBehalfOf: convertRows(onBehalfOfResult.rows),
+    pendingCollection: convertRows(pendingCollectionResult.rows)
   });
 });
 
